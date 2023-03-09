@@ -1,16 +1,25 @@
-import { Action, ActionPanel, Detail, Icon, List } from '@raycast/api';
+import {
+  Action,
+  ActionPanel,
+  Detail,
+  Icon,
+  List,
+  popToRoot,
+  showToast,
+  Toast,
+} from '@raycast/api';
 import { useEffect, useState } from 'react';
 
 import Service, { Account, DnsRecord, Zone } from './service';
 import {
-  getEmail,
-  getKey,
+  getToken,
   getSiteStatusIcon,
   getSiteUrl,
   handleNetworkError,
 } from './utils';
+import { CachePurgeView, purgeEverything } from './view-cache-purge';
 
-const service = new Service(getEmail(), getKey());
+const service = new Service(getToken());
 
 function Command() {
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -23,12 +32,14 @@ function Command() {
         const accounts = await service.listAccounts();
         setAccounts(accounts);
 
+        // load zones of each account simultaneously
         const sites: Record<string, Zone[]> = {};
-        for (let i = 0; i < accounts.length; i++) {
-          const account = accounts[i];
-          const accountSites = await service.listZones(account);
-          sites[account.id] = accountSites;
-        }
+        const zoneRequests = accounts.map(async (account) => {
+          const zones = await service.listZones(account);
+          sites[account.id] = zones;
+        });
+        await Promise.all(zoneRequests);
+
         setSites(sites);
         setLoading(false);
       } catch (e) {
@@ -49,7 +60,7 @@ function Command() {
           const account = accounts.find((account) => account.id === accountId);
           const name = account?.name || '';
           return (
-            <List.Section title={name}>
+            <List.Section title={name} key={accountId}>
               {accountSites.map((site) => (
                 <List.Item
                   actions={
@@ -64,10 +75,31 @@ function Command() {
                         title="Show DNS Records"
                         target={<DnsRecordView siteId={site.id} />}
                       />
+                      <Action.Push
+                        icon={Icon.Hammer}
+                        title="Purge Files from Cache by URL"
+                        target={
+                          <CachePurgeView accountId={accountId} id={site.id} />
+                        }
+                        shortcut={{ modifiers: ['cmd'], key: 'p' }}
+                      />
+                      <Action
+                        icon={Icon.Hammer}
+                        title="Purge Everything from Cache"
+                        shortcut={{ modifiers: ['cmd'], key: 'e' }}
+                        onAction={async () => {
+                          purgeEverything(site);
+                        }}
+                      ></Action>
                       <Action.OpenInBrowser
                         title="Open on Cloudflare"
                         url={getSiteUrl(accountId, site.name)}
                         shortcut={{ modifiers: ['cmd'], key: 'f' }}
+                      />
+                      <Action
+                        icon={Icon.ArrowClockwise}
+                        title="Reload sites from Cloudflare"
+                        onAction={clearSiteCache}
                       />
                     </ActionPanel>
                   }
@@ -83,7 +115,7 @@ function Command() {
   );
 }
 
-interface SiteProps {
+export interface SiteProps {
   accountId: string;
   id: string;
 }
@@ -187,6 +219,15 @@ function DnsRecordView(props: DnsRecordProps) {
       ))}
     </List>
   );
+}
+
+async function clearSiteCache() {
+  service.clearCache();
+  showToast({
+    style: Toast.Style.Success,
+    title: 'Local site cache cleared',
+  });
+  popToRoot({ clearSearchBar: true });
 }
 
 export default Command;

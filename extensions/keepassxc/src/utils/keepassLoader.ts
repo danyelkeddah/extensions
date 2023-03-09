@@ -1,108 +1,204 @@
-import { copyTextToClipboard, pasteText, getPreferenceValues } from "@raycast/api";
-import { promisify } from "util";
-import fs from "fs";
+import { Clipboard, getPreferenceValues, showHUD } from "@raycast/api";
 import path from "path";
 import child_process from "child_process";
-import CryptoJS from "crypto-js";
-const stat = promisify(fs.stat);
-const exec = promisify(child_process.exec);
+import { runAppleScript } from "run-applescript";
+const spawn = child_process.spawn;
 
 interface Preference {
-  keepassxcRootPath: string;
+  keepassxcRootPath: {
+    name: string;
+    path: string;
+    bundleId: string;
+  };
   database: string;
   dbPassword: string;
+  keyFile: string;
 }
 
-const preferences: Preference = getPreferenceValues();
+const getKeepassXCVersion = () =>
+  new Promise<number>((resolve, reject) => {
+    const cli = spawn(`${keepassxcCli}`, ["--version"]);
+    cli.stderr.on("data", cliStdOnErr(reject));
+    const chuncks: Buffer[] = [];
+    cli.stdout.on("data", (chunck) => {
+      chuncks.push(chunck);
+    });
+    cli.stdout.on("end", () => {
+      const version = parseFloat(chuncks.join("").toString().split(".").slice(0, 2).join("."));
+      console.log("current keepassxc version:", version);
+      // remove \n in the end
+      resolve(version);
+    });
+  });
 
-// this file is used to cache entries (without password) in the database
-const cacheFile = path.join("/tmp/", CryptoJS.enc.Utf8.parse(preferences.database).toString().slice(0, 8) + ".cache");
+const preferences: Preference = getPreferenceValues();
 // keepass database file path
 const database = preferences.database;
 // password for keepass database
 const dbPassword = preferences.dbPassword;
+// Key File for keepass database
+const keyFile = preferences.keyFile;
 // keepass-cli executable path
-const keepassxcCli = path.join(preferences.keepassxcRootPath, "Contents/MacOS/keepassxc-cli");
-const key = CryptoJS.enc.Utf8.parse(preferences.dbPassword);
-const iv = CryptoJS.enc.Utf8.parse(preferences.database);
-const decrypt = (word: string) => {
-  const encryptedHexStr = CryptoJS.enc.Hex.parse(word);
-  const srcs = CryptoJS.enc.Base64.stringify(encryptedHexStr);
-  const decrypt = CryptoJS.AES.decrypt(srcs, key, { iv: iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 });
-  const decryptedStr = decrypt.toString(CryptoJS.enc.Utf8);
-  return decryptedStr.toString();
+const keepassxcCli = path.join(preferences.keepassxcRootPath.path, "Contents/MacOS/keepassxc-cli");
+// search entry command, since version 2.7 command 'locate' has been renamed to 'search'
+const getSearchEntryCommand = async () => ((await getKeepassXCVersion()) >= 2.7 ? "search" : "locate");
+const keyFileOption = keyFile != "" && keyFile != null ? ["-k", `${keyFile}`] : [];
+// cli options
+const cliOptions = [...keyFileOption, "-q", "-a"];
+const entryFilter = (entryStr: string) => {
+  return entryStr
+    .split("\n")
+    .map((f: string) => f.trim())
+    .filter(
+      (f: string) =>
+        f !== undefined &&
+        !f.startsWith("/回收站") &&
+        !f.startsWith("/Trash") &&
+        !f.startsWith("/Deprecated") &&
+        f.length > 0
+    )
+    .sort();
 };
-
-const encrypt = (word: string) => {
-  const srcs = CryptoJS.enc.Utf8.parse(word);
-  const encrypted = CryptoJS.AES.encrypt(srcs, key, { iv: iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 });
-  return encrypted.ciphertext.toString().toUpperCase();
-};
-
 /**
  * load entries from database with keepassxc-cli
  * @returns all entries in keepass database
  */
-const loadEntries = async () => {
-  // a cache file is used to boost response speed of loading entries by avoid calling keepassxc-cli every time (which may take 2 ~ 3 seconds)
-  if (!fs.existsSync(cacheFile)) {
-    const { stdout, stderr } = await exec(`echo "${dbPassword}" | "${keepassxcCli}" locate "${database}" /`);
-    if (stderr.includes("Error")) {
-      throw new Error(stderr.toString());
-    }
-    fs.writeFileSync(cacheFile, encrypt(stdout.toString()));
-  }
-  const lastModifiedTime = (await stat(cacheFile)).mtime.getTime();
-  const currTime = new Date().getTime();
-  let data = "";
-  if (currTime - lastModifiedTime <= 1000 * 60 && fs.existsSync(cacheFile)) {
-    // load entries from cache
-    data = decrypt(fs.readFileSync(cacheFile, "utf8"));
-  } else {
-    // call keepassxc-cli to refresh cache file if it is more than 1 minute since last modified
-    const { stdout, stderr } = await exec(`echo "${dbPassword}" | "${keepassxcCli}" locate "${database}" /`);
-    if (stderr.includes("Error")) {
-      throw new Error(stderr.toString());
-    }
-    fs.writeFileSync(cacheFile, encrypt(stdout.toString()));
-    data = stdout.toString();
-  }
-  return data
-    .split("\n")
-    .map((f: string) => f.trim())
-    .filter((f: string) => f !== undefined && !f.startsWith("/回收站") && !f.startsWith("/Trash") && f.length > 0);
-};
-
-const getPassword = async (entry: string) => {
-  const { stdout } = await exec(
-    `echo "${dbPassword}"  | "${keepassxcCli}"  show -q  -a Password "${database}" "${entry}"`
+const loadEntries = () =>
+  getSearchEntryCommand().then(
+    (cmd) =>
+      new Promise<string[]>((resolve, reject) => {
+        const search_keywrod = cmd === "search" ? "" : "/";
+        const cli = spawn(`${keepassxcCli}`, [cmd, ...keyFileOption, "-q", `${database}`, search_keywrod]);
+        cli.stdin.write(`${dbPassword}\n`);
+        cli.stdin.end();
+        cli.on("error", reject);
+        cli.stderr.on("data", cliStdOnErr(reject));
+        const chuncks: Buffer[] = [];
+        cli.stdout.on("data", (chunck) => {
+          chuncks.push(chunck);
+        });
+        // finish when all chunck has been collected
+        cli.stdout.on("end", () => {
+          resolve(entryFilter(chuncks.join("").toString()));
+        });
+      })
   );
-  return stdout.toString().trim();
+
+const cliStdOnErr = (reject: (reason: Error) => void) => (data: Buffer) => {
+  if (data.toString().indexOf("Enter password to unlock") != -1 || data.toString().trim().length == 0) {
+    return;
+  }
+  reject(new Error(data.toString()));
 };
 
-const getUsername = async (entry: string) => {
-  const { stdout } = await exec(
-    `echo "${dbPassword}"  | "${keepassxcCli}"  show -q  -a Username "${database}" "${entry}"`
-  );
-  return stdout.toString().trim();
-};
+const getPassword = (entry: string) =>
+  new Promise<string>((resolve, reject) => {
+    const cli = spawn(`${keepassxcCli}`, ["show", ...cliOptions, "Password", `${database}`, `${entry}`]);
+    cli.stdin.write(`${dbPassword}\n`);
+    cli.stdin.end();
+    cli.on("error", reject);
+    cli.stderr.on("data", cliStdOnErr(reject));
+    const chuncks: Buffer[] = [];
+    cli.stdout.on("data", (chunck) => {
+      chuncks.push(chunck);
+    });
+    cli.stdout.on("end", () => {
+      const password = chuncks.join("").toString();
+      // remove \n in the end
+      resolve(password.slice(0, password.length - 1));
+    });
+  });
 
-const copyAndPastePassword = async (entry: string) => {
-  return copyPassword(entry).then((password) => {
-    return pasteText(password).then(() => password);
+const getUsername = (entry: string) =>
+  new Promise<string>((resolve, reject) => {
+    const cli = spawn(`${keepassxcCli}`, ["show", ...cliOptions, "Username", `${database}`, `${entry}`]);
+    cli.stdin.write(`${dbPassword}\n`);
+    cli.stdin.end();
+    cli.on("error", reject);
+    cli.stderr.on("data", cliStdOnErr(reject));
+    const chuncks: Buffer[] = [];
+    cli.stdout.on("data", (chunck) => {
+      chuncks.push(chunck);
+    });
+    cli.stdout.on("end", () => {
+      const username = chuncks.join("").toString();
+      // remove \n in the end
+      resolve(username.slice(0, username.length - 1));
+    });
+  });
+
+const pastePassword = async (entry: string) => {
+  console.log("paste password of entry:", entry);
+  return getPassword(entry).then((password) => {
+    return Clipboard.paste(password).then(() => password);
   });
 };
 
 const copyPassword = async (entry: string) =>
-  getPassword(entry).then((password) => copyTextToClipboard(password).then(() => password));
+  getPassword(entry).then((password) => {
+    showHUD("Password has been Copied to Clipboard");
+    return protectedCopy(password).then(() => password);
+  });
 
-const copyAndPasteUsername = async (entry: string) => {
-  return copyUsername(entry).then((username) => {
-    return pasteText(username).then(() => username);
+const pasteUsername = async (entry: string) => {
+  console.log("paste username of entry:", entry);
+  return getUsername(entry).then((username) => {
+    return Clipboard.paste(username).then(() => username);
   });
 };
 
 const copyUsername = async (entry: string) =>
-  getUsername(entry).then((username) => copyTextToClipboard(username).then(() => username));
+  getUsername(entry).then((username) => {
+    showHUD("Username has been Copied to Clipboard");
+    return Clipboard.copy(username).then(() => username);
+  });
 
-export { loadEntries, copyAndPastePassword, getPassword, copyPassword, copyUsername, copyAndPasteUsername };
+const copyTOTP = async (entry: string) =>
+  getTOTP(entry).then((otp) => {
+    showHUD("TOTP has been Copied to Clipboard");
+    return protectedCopy(otp).then(() => otp);
+  });
+
+const getTOTP = (entry: string) =>
+  new Promise<string>((resolve, reject) => {
+    const cli = spawn(`${keepassxcCli}`, [
+      "show",
+      ...cliOptions.filter((x) => x != "-a"),
+      "-t",
+      `${database}`,
+      `${entry}`,
+    ]);
+    cli.stdin.write(`${dbPassword}\n`);
+    cli.stdin.end();
+    cli.on("error", reject);
+    cli.stderr.on("data", cliStdOnErr(reject));
+    const chuncks: Buffer[] = [];
+    cli.stdout.on("data", (chunck) => {
+      chuncks.push(chunck);
+    });
+    cli.stdout.on("end", () => {
+      const otp = chuncks.join("").toString();
+      // remove \n in the end
+      resolve(otp.slice(0, otp.length - 1));
+    });
+  });
+
+async function protectedCopy(concealString: string) {
+  // await closeMainWindow();
+  const script = `
+      use framework "Foundation"
+      set type to current application's NSPasteboardTypeString
+      set pb to current application's NSPasteboard's generalPasteboard()
+      pb's clearContents()
+      pb's setString:"" forType:"org.nspasteboard.ConcealedType"
+      pb's setString:"${concealString}" forType:type
+    `;
+  try {
+    await runAppleScript(script);
+  } catch {
+    // Applescript failed to conceal what is being placed in the pasteboard
+    await showHUD("Protect copy failed...");
+  }
+}
+
+export { loadEntries, pastePassword, getPassword, copyPassword, copyUsername, pasteUsername, copyTOTP };

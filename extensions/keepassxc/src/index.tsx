@@ -1,12 +1,13 @@
-import { ActionPanel, closeMainWindow, Icon, List, showToast, ToastStyle } from "@raycast/api";
-import { loadEntries, copyAndPastePassword, copyPassword, copyUsername } from "./utils/keepassLoader";
+import { Action, ActionPanel, closeMainWindow, Icon, List, showToast, Toast } from "@raycast/api";
+import { loadEntries, pastePassword, copyPassword, copyUsername, copyTOTP } from "./utils/keepassLoader";
 import { useState, useEffect } from "react";
 
 const errorHandler = (e: { message: string }) => {
+  console.error(e);
   let invalidPreference = "";
   if (e.message.includes("Invalid credentials were provided")) {
     invalidPreference = "Password";
-  } else if (e.message.includes("keepassxc-cli: No such file or directory")) {
+  } else if (e.message.includes("keepassxc-cli: No such file or directory") || e.message.includes("ENOENT")) {
     invalidPreference = "Path of KeepassXC.app";
   } else if (
     e.message.includes("Failed to open database file") ||
@@ -20,7 +21,7 @@ const errorHandler = (e: { message: string }) => {
     toastTitle = `Invalid Preference: ${invalidPreference}`;
     toastMessage = "Please Check Extension Preference.";
   }
-  showToast(ToastStyle.Failure, toastTitle, toastMessage);
+  showToast(Toast.Style.Failure, toastTitle, toastMessage);
 };
 
 export default function Command() {
@@ -30,9 +31,10 @@ export default function Command() {
     loadEntries()
       .then(setEntries)
       .catch(errorHandler)
-      .then(() => setIsLoading(false));
+      .then(() => {
+        setIsLoading(false);
+      });
   }, []);
-
   return (
     <List isLoading={isLoading} searchBarPlaceholder="Type to Search in KeepassXC" throttle={true}>
       {entries?.map((entry, i) => (
@@ -50,27 +52,43 @@ export default function Command() {
           keywords={entry.split("/").slice(1)}
           actions={
             <ActionPanel>
-              <ActionPanel.Item
+              <Action
                 title="Paste"
-                icon={Icon.TextDocument}
+                icon={Icon.BlankDocument}
                 onAction={() => {
-                  copyAndPastePassword(entry).then(() => closeMainWindow());
+                  pastePassword(entry)
+                    .then(() => closeMainWindow())
+                    .catch(errorHandler);
                 }}
               />
-              <ActionPanel.Item
+              <Action
                 title="Copy Password"
                 icon={Icon.Clipboard}
                 shortcut={{ modifiers: ["cmd"], key: "enter" }}
                 onAction={() => {
-                  copyPassword(entry).then(() => closeMainWindow());
+                  copyPassword(entry)
+                    .then(() => closeMainWindow())
+                    .catch(errorHandler);
                 }}
               />
-              <ActionPanel.Item
+              <Action
                 title="Copy Username"
                 icon={Icon.Clipboard}
                 shortcut={{ modifiers: ["cmd"], key: "b" }}
                 onAction={() => {
-                  copyUsername(entry).then(() => closeMainWindow());
+                  copyUsername(entry)
+                    .then(() => closeMainWindow())
+                    .catch(errorHandler);
+                }}
+              />
+              <Action
+                title="Copy TOTP"
+                icon={Icon.Clipboard}
+                shortcut={{ modifiers: ["cmd"], key: "t" }}
+                onAction={() => {
+                  copyTOTP(entry)
+                    .then(() => closeMainWindow())
+                    .catch(errorHandler);
                 }}
               />
             </ActionPanel>
